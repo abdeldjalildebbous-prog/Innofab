@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>InnoFab — Station de capture</title>
+<style>
+  :root { --blue:#1F4E79; --light:#EAF1F8; --ok:#1E7B34; --err:#B3261E; --grey:#555; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system, system-ui, sans-serif; background:#FAFAFC; color:#1a1a1a;
+         padding:calc(env(safe-area-inset-top) + 12px) 16px calc(env(safe-area-inset-bottom) + 24px); }
+  h1 { font-size:20px; color:var(--blue); margin:4px 0 12px; }
+  h2 { font-size:15px; color:var(--blue); margin:18px 0 8px; }
+  .card { background:var(--light); border-radius:14px; padding:12px 14px; margin-bottom:12px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button { font-size:15px; padding:11px 14px; border-radius:22px; border:1.5px solid var(--blue);
+           background:#fff; color:var(--blue); font-weight:600; }
+  button.primary { background:var(--blue); color:#fff; }
+  button:disabled { opacity:.35; }
+  .err { color:var(--err); margin:6px 0; }
+  .muted { color:var(--grey); font-size:13px; }
+  label { display:block; margin:10px 0 2px; font-size:14px; }
+  input[type=range] { width:100%; }
+  video { width:100%; border-radius:12px; background:#000; aspect-ratio:4/3; object-fit:cover; }
+  progress { width:100%; height:10px; }
+  .big { font-size:17px; font-weight:600; }
+</style>
+</head>
+<body>
+<h1>Station de capture InnoFab</h1>
+
+<div class="card">
+  <div class="big" id="link">Liaison : déconnectée</div>
+  <div id="stateLine">Aucun état reçu</div>
+  <div id="errLine" class="err"></div>
+</div>
+<div class="row">
+  <button class="primary" id="btnConnect">Connecter</button>
+  <button id="btnDisconnect" disabled>Déconnecter</button>
+</div>
+<p class="muted" id="support"></p>
+
+<h2>Réglages</h2>
+<label>Poses par tour : <b id="nVal">60</b> — <span id="degVal">6,0°</span> par pose</label>
+<input type="range" id="n" min="1" max="600" value="60">
+<label>Stabilisation : <b id="tVal">600</b> ms</label>
+<input type="range" id="tstab" min="0" max="3000" step="50" value="600">
+<div class="row" style="margin-top:10px">
+  <button id="btnCfg" disabled>Appliquer</button>
+  <button id="btnHome" disabled>HOME (origine)</button>
+</div>
+<div class="row" style="margin-top:8px">
+  <button id="btnJogM" disabled>−6,0°</button>
+  <button id="btnJogP" disabled>+6,0°</button>
+  <button id="btnRelease" disabled>Relâcher moteur</button>
+</div>
+
+<h2>Capture</h2>
+<video id="video" playsinline muted autoplay></video>
+<div class="row" style="margin-top:8px">
+  <button id="btnCam">Activer la caméra</button>
+</div>
+<p id="progressText" class="big">Pose – / –</p>
+<progress id="progress" value="0" max="1"></progress>
+<p id="photoCount" class="muted">Photos : 0</p>
+<div class="row">
+  <button class="primary" id="btnStart" disabled>START</button>
+  <button id="btnPause" disabled>PAUSE</button>
+  <button id="btnAbort" disabled>ABORT</button>
+</div>
+<div class="row" style="margin-top:10px">
+  <button id="btnSave" disabled>Enregistrer les photos (ZIP)</button>
+</div>
+<canvas id="canvas" hidden></canvas>
+
+<script>
+"use strict";
+// ---- Protocole (identique au firmware ESP32 et à l'application Android) ----
+const SERVICE = "5a3e0001-7c2b-4d8f-9b61-2e4f8a1c6d30";
+const CFG_UUID = "5a3e0002-7c2b-4d8f-9b61-2e4f8a1c6d30";
+const CMD_UUID = "5a3e0003-7c2b-4d8f-9b61-2e4f8a1c6d30";
+const STATE_UUID = "5a3e0004-7c2b-4d8f-9b61-2e4f8a1c6d30";
+const OP = { HOME:1, START:2, SHOT_OK:3, PAUSE:4, ABORT:5, JOG:6, RELEASE:7 };
+const STATES = ["IDLE","HOMING","READY","MOVING","SETTLING","WAIT_SHOT","DONE","ERROR"];
+const ERRORS = ["", "photo non confirmée à temps", "liaison perdue", "origine non trouvée",
+                "configuration refusée", "origine non définie (faire HOME)",
+                "commande refusée dans cet état", "commande inconnue"];
+const STEPS_PER_REV = 600;         // 1 pas = 0,6° de couronne
+
+const $ = id => document.getElementById(id);
+let device = null, cmdChar = null, cfgChar = null, stateChar = null;
+let status = null, config = null;
+let capturing = false, lastShotPose = -1, shotBusy = false;
+let photos = [];                   // { name, blob }
+let stream = null;
+
+// Web Bluetooth refuse deux opérations GATT simultanées : on les enchaîne.
+let gattQueue = Promise.resolve();
+function gatt(op) {
+  gattQueue = gattQueue.then(op).catch(e => showError("Bluetooth : " + e.message));
+  return gattQueue;
+}
+
+function showError(msg) { $("errLine").textContent = msg || ""; }
+
+// ---- Encodage little-endian ----
+function cmd(op, argBytes = []) { return new Uint8Array([op, ...argBytes]); }
+function u16(v) { return [v & 0xff, (v >> 8) & 0xff]; }
+function i32(v) { const b = new ArrayBuffer(4); new DataView(b).setInt32(0, v, true); return [...new Uint8Array(b)]; }
+
+function decodeState(dv) {
+  if (dv.byteLength < 8) return null;
+  return { state: dv.getUint8(0), pose: dv.getUint16(1, true),
+           position: dv.getInt32(3, true), error: dv.getUint8(7) };
+}
+function decodeCfg(dv) {
+  if (dv.byteLength < 8) return null;
+  return { n: dv.getUint16(0, true), vmax: dv.getUint16(2, true),
+           accel: dv.getUint16(4, true), tstab: dv.getUint16(6, true) };
+}
+
+function sendCmd(bytes) {
+  if (!cmdChar) return;
+  return gatt(() => cmdChar.writeValueWithoutResponse
+    ? cmdChar.writeValueWithoutResponse(bytes) : cmdChar.writeValue(bytes));
+}
+
+// ---- Connexion ----
+async function connect() {
+  showError("");
+  if (!navigator.bluetooth) {
+    showError("Ce navigateur ne gère pas le Bluetooth web. Sur iPhone, ouvrez cette page dans l'application Bluefy.");
+    return;
+  }
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: "TurnTable" }], optionalServices: [SERVICE] });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+    $("link").textContent = "Liaison : connexion…";
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SERVICE);
+    cmdChar = await svc.getCharacteristic(CMD_UUID);
+    cfgChar = await svc.getCharacteristic(CFG_UUID);
+    stateChar = await svc.getCharacteristic(STATE_UUID);
+    stateChar.addEventListener("characteristicvaluechanged", e => onState(decodeState(e.target.value)));
+    await stateChar.startNotifications();
+    // La station ne notifie qu'aux changements : lecture initiale de l'état et de la config
+    onState(decodeState(await stateChar.readValue()));
+    onCfg(decodeCfg(await cfgChar.readValue()));
+    $("link").textContent = "Liaison : connectée";
+    setConnected(true);
+  } catch (e) {
+    if (e.name !== "NotFoundError") showError("Connexion impossible : " + e.message);
+    $("link").textContent = "Liaison : déconnectée";
+  }
+}
+
+function onDisconnected() {
+  cmdChar = cfgChar = stateChar = null;
+  $("link").textContent = "Liaison : déconnectée";
+  if (capturing) showError("Liaison perdue pendant la série. Reconnectez puis START pour reprendre.");
+  capturing = false;
+  setConnected(false);
+}
+
+function disconnect() {
+  if (device && device.gatt.connected) device.gatt.disconnect();
+}
+
+function setConnected(on) {
+  for (const id of ["btnDisconnect","btnCfg","btnHome","btnJogM","btnJogP","btnRelease",
+                    "btnStart","btnPause","btnAbort"]) $(id).disabled = !on;
+  $("btnConnect").disabled = on;
+}
+
+// ---- État de la station ----
+function onState(s) {
+  if (!s) return;
+  status = s;
+  const name = STATES[s.state] || "?";
+  $("stateLine").textContent = `État : ${name} — pose ${s.pose} — position ${s.position} pas`;
+  if (s.error) showError("Station : " + (ERRORS[s.error] || "erreur " + s.error));
+  const total = config ? config.n : 0;
+  $("progressText").textContent = `Pose ${s.pose} / ${total || "–"}`;
+  $("progress").max = total || 1;
+  $("progress").value = Math.min(s.pose, total || 1);
+
+  if (!capturing) return;
+  if (name === "WAIT_SHOT" && !shotBusy && lastShotPose !== s.pose) takePhoto(s.pose);
+  else if (name === "DONE") { capturing = false; $("btnSave").disabled = photos.length === 0; }
+  else if (name === "ERROR") capturing = false;
+}
+
+function onCfg(c) {
+  if (!c) return;
+  config = c;
+  $("n").value = c.n; $("tstab").value = Math.min(c.tstab, 3000);
+  refreshLabels();
+}
+
+function poseSteps() { return Math.max(1, Math.floor(STEPS_PER_REV / Number($("n").value))); }
+
+function refreshLabels() {
+  const n = Number($("n").value);
+  $("nVal").textContent = n;
+  $("degVal").textContent = (360 / n).toFixed(1).replace(".", ",") + "°";
+  $("tVal").textContent = $("tstab").value;
+  const deg = (poseSteps() * 0.6).toFixed(1).replace(".", ",");
+  $("btnJogM").textContent = "−" + deg + "°";
+  $("btnJogP").textContent = "+" + deg + "°";
+}
+
+function applyConfig() {
+  if (!cfgChar) return;
+  const cur = config || { vmax: 30, accel: 100 };
+  const n = Number($("n").value), t = Number($("tstab").value);
+  const bytes = new Uint8Array([...u16(n), ...u16(cur.vmax), ...u16(cur.accel), ...u16(t)]);
+  gatt(async () => {
+    await (cfgChar.writeValueWithResponse ? cfgChar.writeValueWithResponse(bytes) : cfgChar.writeValue(bytes));
+    onCfg(decodeCfg(await cfgChar.readValue()));
+  });
+}
+
+// ---- Caméra et capture ----
+async function startCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: {
+      facingMode: { ideal: "environment" }, width: { ideal: 3840 }, height: { ideal: 2160 } } });
+    $("video").srcObject = stream;
+    $("btnCam").textContent = "Caméra active";
+    $("btnCam").disabled = true;
+  } catch (e) {
+    showError("Caméra indisponible : " + e.message);
+  }
+}
+
+function startCapture() {
+  if (!stream) { showError("Activez d'abord la caméra."); return; }
+  photos = []; lastShotPose = -1; capturing = true;
+  $("photoCount").textContent = "Photos : 0";
+  $("btnSave").disabled = true;
+  showError("");
+  sendCmd(cmd(OP.START));
+}
+
+function takePhoto(pose) {
+  const v = $("video");
+  if (!v.videoWidth) { showError("Caméra non prête"); return; }
+  shotBusy = true;
+  const c = $("canvas");
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext("2d").drawImage(v, 0, 0);
+  c.toBlob(blob => {
+    shotBusy = false;
+    if (!blob) { showError("Échec de la prise de vue"); return; }
+    photos.push({ name: "pose_" + String(pose).padStart(3, "0") + ".jpg", blob });
+    lastShotPose = pose;
+    $("photoCount").textContent = `Photos : ${photos.length} (${v.videoWidth}×${v.videoHeight})`;
+    sendCmd(cmd(OP.SHOT_OK, u16(pose)));
+  }, "image/jpeg", 0.92);
+}
+
+// ---- Archive ZIP (sans compression) pour récupérer toutes les photos d'un coup ----
+const CRC_TABLE = (() => { const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+  return t; })();
+function crc32(bytes) { let c = 0xFFFFFFFF; for (const b of bytes) c = CRC_TABLE[(c ^ b) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+
+async function makeZip(files) {
+  const parts = [], central = [];
+  let offset = 0;
+  for (const f of files) {
+    const data = new Uint8Array(await f.blob.arrayBuffer());
+    const name = new TextEncoder().encode(f.name);
+    const crc = crc32(data);
+    const h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint32(14, crc, true);
+    h.setUint32(18, data.length, true); h.setUint32(22, data.length, true); h.setUint16(26, name.length, true);
+    parts.push(h.buffer, name, data);
+    const cd = new DataView(new ArrayBuffer(46));
+    cd.setUint32(0, 0x02014b50, true); cd.setUint16(4, 20, true); cd.setUint16(6, 20, true);
+    cd.setUint32(16, crc, true); cd.setUint32(20, data.length, true); cd.setUint32(24, data.length, true);
+    cd.setUint16(28, name.length, true); cd.setUint32(42, offset, true);
+    central.push(cd.buffer, name);
+    offset += 30 + name.length + data.length;
+  }
+  const cdSize = central.reduce((s, p) => s + p.byteLength, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+  end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, end.buffer], { type: "application/zip" });
+}
+
+async function savePhotos() {
+  if (!photos.length) return;
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+  const zip = await makeZip(photos);
+  const file = new File([zip], `capture_${stamp}.zip`, { type: "application/zip" });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file], title: "Photos de capture" }); return; }
+    catch (e) { if (e.name === "AbortError") return; }
+  }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(file); a.download = file.name;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+// ---- Branchements ----
+$("btnConnect").onclick = connect;
+$("btnDisconnect").onclick = disconnect;
+$("btnHome").onclick = () => sendCmd(cmd(OP.HOME));
+$("btnJogM").onclick = () => sendCmd(cmd(OP.JOG, i32(-poseSteps())));
+$("btnJogP").onclick = () => sendCmd(cmd(OP.JOG, i32(poseSteps())));
+$("btnRelease").onclick = () => sendCmd(cmd(OP.RELEASE));
+$("btnCfg").onclick = applyConfig;
+$("btnCam").onclick = startCamera;
+$("btnStart").onclick = startCapture;
+$("btnPause").onclick = () => sendCmd(cmd(OP.PAUSE));
+$("btnAbort").onclick = () => { capturing = false; sendCmd(cmd(OP.ABORT)); };
+$("btnSave").onclick = savePhotos;
+$("n").oninput = refreshLabels;
+$("tstab").oninput = refreshLabels;
+refreshLabels();
+if (!navigator.bluetooth)
+  $("support").textContent = "Bluetooth web absent de ce navigateur : sur iPhone, utilisez l'application Bluefy.";
+</script>
+</body>
+</html>
